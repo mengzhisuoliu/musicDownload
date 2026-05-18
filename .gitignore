@@ -1,3 +1,4 @@
 /.musicdl_temp
 /build
 /dist
+/*.spec

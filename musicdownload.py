@@ -56,6 +56,43 @@ def sanitize_filename(filename):
     return re.sub(r'[\\/*?:"<>|]', "_", str(filename))
 
 
+class NumericTableItem(QTableWidgetItem):
+    """支持按数值排序的表格项（用于大小、时长等列）"""
+
+    def __lt__(self, other):
+        if isinstance(other, QTableWidgetItem):
+            my_val = self.data(Qt.ItemDataRole.UserRole)
+            other_val = other.data(Qt.ItemDataRole.UserRole)
+            if my_val is not None and other_val is not None:
+                try:
+                    return float(my_val) < float(other_val)
+                except (ValueError, TypeError):
+                    pass
+        return super().__lt__(other)
+
+
+def extract_numeric_value(text):
+    """从显示文本中提取数值用于排序"""
+    text = str(text).strip()
+    if not text:
+        return 0
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    if ":" in text:
+        parts = text.split(":")
+        try:
+            if len(parts) == 2:
+                return int(parts[0]) * 60 + float(parts[1])
+        except ValueError:
+            pass
+    import re as _re
+
+    m = _re.match(r"([\d.]+)", text)
+    return float(m.group(1)) if m else 0
+
+
 # ================= 自定义现代 UI 组件 (保留原样) =================
 class ModernComboBox(QComboBox):
     def paintEvent(self, event):
@@ -625,6 +662,11 @@ class MusicDownloader(QMainWindow):
         self.results_table.setColumnWidth(7, 70)
         self.results_table.verticalHeader().setDefaultSectionSize(54)
 
+        self.results_table.setSortingEnabled(True)
+        header = self.results_table.horizontalHeader()
+        header.setSortIndicatorShown(True)
+        header.setSectionsClickable(True)
+
         layout.addWidget(self.results_table)
         parent_layout.addLayout(layout)
 
@@ -668,12 +710,19 @@ class MusicDownloader(QMainWindow):
         menu.exec(self.results_table.mapToGlobal(pos))
 
     def download_current_row(self):
-        # 原样
+        # 获取当前行对应的 checkbox，并从 checkbox 上取得绑定的 song_info，
+        # 这样在表格排序后仍可保证下载顺序与可视顺序一致。
         if self.current_right_click_row < 0 or not self.music_client:
             return
-        if str(self.current_right_click_row) not in self.music_records:
+        cell_widget = self.results_table.cellWidget(self.current_right_click_row, 0)
+        if not cell_widget:
             return
-        song_info = self.music_records[str(self.current_right_click_row)]
+        checkbox = cell_widget.findChild(QCheckBox)
+        song_info = getattr(checkbox, "song_info", None) or self.music_records.get(
+            str(self.current_right_click_row)
+        )
+        if not song_info:
+            return
         song_name = song_info.get("song_name", "未知歌曲")
         singers = ", ".join(song_info.get("singers", []))
 
@@ -779,6 +828,7 @@ class MusicDownloader(QMainWindow):
         return ""
 
     def load_table_with_results(self, search_results):
+        self.results_table.setSortingEnabled(False)
         self.results_table.setRowCount(0)
         self.search_results = search_results
         self.music_records = {}
@@ -797,7 +847,10 @@ class MusicDownloader(QMainWindow):
                 # Checkbox
                 w = QWidget()
                 lay = QHBoxLayout(w)
-                lay.addWidget(QCheckBox())
+                checkbox = QCheckBox()
+                # attach song_info to checkbox so it stays with the widget when the table is sorted
+                checkbox.song_info = per_source_search_result
+                lay.addWidget(checkbox)
                 lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
                 lay.setContentsMargins(0, 0, 0, 0)
                 self.results_table.setCellWidget(row, 0, w)
@@ -809,22 +862,25 @@ class MusicDownloader(QMainWindow):
                     per_source_search_result.get("source", ""), ""
                 )
 
-                items = [
-                    "",
-                    "",
-                    str(song_name),
-                    str(singers),
-                    str(album),
-                    self.get_file_format(per_source_search_result),
-                    str(per_source_search_result.get("file_size", "")),
-                    str(per_source_search_result.get("duration", "")),
-                    str(source_cn),
+                columns_data = [
+                    (2, str(song_name)),
+                    (3, str(singers)),
+                    (4, str(album)),
+                    (5, self.get_file_format(per_source_search_result)),
+                    (6, str(per_source_search_result.get("file_size", ""))),
+                    (7, str(per_source_search_result.get("duration", ""))),
+                    (8, str(source_cn)),
                 ]
 
-                for column, text in enumerate(items):
-                    if column in [0, 1]:
-                        continue
-                    table_item = QTableWidgetItem(text)
+                for column, text in columns_data:
+                    if column in (6, 7):
+                        table_item = NumericTableItem(text)
+                        table_item.setData(
+                            Qt.ItemDataRole.UserRole,
+                            extract_numeric_value(text),
+                        )
+                    else:
+                        table_item = QTableWidgetItem(text)
                     align = (
                         Qt.AlignmentFlag.AlignLeft
                         if column in [2, 3, 4]
@@ -848,6 +904,7 @@ class MusicDownloader(QMainWindow):
                 row += 1
 
         self.btn_download.setEnabled(row > 0)
+        self.results_table.setSortingEnabled(True)
 
         if self.auto_download_after_search and all_songs:
             self._start_download_task(all_songs, f"正在处理 {len(all_songs)} 首歌曲")
@@ -916,8 +973,13 @@ class MusicDownloader(QMainWindow):
                 or (scope == "勾选" and is_checked)
                 or (scope == "未勾选" and not is_checked)
             ):
-                if str(row) in self.music_records:
-                    songs.append(self.music_records[str(row)])
+                # 首先尝试从 checkbox 获取绑定的 song_info（此对象随行排序移动），
+                # 否则退回到旧的 music_records 映射以保持兼容性。
+                song_info = getattr(checkbox, "song_info", None)
+                if not song_info and str(row) in self.music_records:
+                    song_info = self.music_records[str(row)]
+                if song_info:
+                    songs.append(song_info)
         return songs
 
     def on_search(self):
